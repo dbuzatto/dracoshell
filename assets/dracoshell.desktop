@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=dracoshell
+GenericName=Terminal
+Comment=Tiling terminal for Unix
+Exec=dracoshell
+Icon=dracoshell
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=shell;terminal;tiling;
+StartupWMClass=dracoshell
