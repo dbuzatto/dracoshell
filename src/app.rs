@@ -7,16 +7,19 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::dpi::PhysicalPosition;
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 #[cfg(target_os = "linux")]
 use winit::platform::wayland::WindowAttributesExtWayland;
 #[cfg(target_os = "linux")]
 use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{Window, WindowId};
 
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+
 use crate::config::Config;
 use crate::layout::{Direction, Layout, PaneId, Rect, Split};
-use crate::renderer::{PaneView, Renderer, TabBarInfo, TAB_WIDTH};
+use crate::renderer::{PaneView, Renderer, TabBarInfo, TAB_WIDTH, PANE_PADDING};
 use crate::terminal::Terminal;
 use crate::UserEvent;
 
@@ -24,6 +27,27 @@ const APP_ID: &str = "dracoshell";
 
 /// Height of the tab bar in pixels. Bar is hidden when there's only one tab.
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
+
+// ── Mouse text selection ──────────────────────────────────────────────────
+
+struct SelectionState {
+    pane_id: PaneId,
+    anchor_col: usize,
+    anchor_row: usize,
+    cur_col: usize,
+    cur_row: usize,
+}
+
+impl SelectionState {
+    /// Returns (col1, row1, col2, row2) with start always before end.
+    fn normalized(&self) -> (usize, usize, usize, usize) {
+        if (self.anchor_row, self.anchor_col) <= (self.cur_row, self.cur_col) {
+            (self.anchor_col, self.anchor_row, self.cur_col, self.cur_row)
+        } else {
+            (self.cur_col, self.cur_row, self.anchor_col, self.anchor_row)
+        }
+    }
+}
 
 // ── First-run onboard wizard ──────────────────────────────────────────────
 
@@ -192,6 +216,9 @@ pub struct App {
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
     onboard: Option<OnboardState>,
+    clipboard: Option<arboard::Clipboard>,
+    selection: Option<SelectionState>,
+    is_selecting: bool,
 }
 
 impl App {
@@ -207,6 +234,9 @@ impl App {
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
             onboard: None,
+            clipboard: arboard::Clipboard::new().ok(),
+            selection: None,
+            is_selecting: false,
         }
     }
 
@@ -529,8 +559,108 @@ impl App {
         self.tabs.iter().position(|t| t.panes.contains_key(&pane))
     }
 
+    fn paste_from_clipboard(&mut self) {
+        let text = match self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()) {
+            Some(t) => t,
+            None => return,
+        };
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            if let Some(term) = tab.panes.get(&tab.layout.focused()) {
+                term.send_bytes(text.into_bytes());
+            }
+        }
+    }
+
+    /// Convert a physical pixel position to (pane_id, col, row) in screen cell coords.
+    fn pixel_to_cell(&self, pos: PhysicalPosition<f64>) -> Option<(PaneId, usize, usize)> {
+        let renderer = self.renderer.as_ref()?;
+        let (cw, ch) = renderer.cell_size();
+        let tab = self.tabs.get(self.active_tab)?;
+        let viewport = self.pane_viewport();
+        let rects = tab.layout.compute(viewport);
+        for (id, rect) in &rects {
+            if pos.x >= rect.x as f64
+                && pos.x < (rect.x + rect.w) as f64
+                && pos.y >= rect.y as f64
+                && pos.y < (rect.y + rect.h) as f64
+            {
+                let rel_x = (pos.x as f32 - rect.x - PANE_PADDING).max(0.0);
+                let rel_y = (pos.y as f32 - rect.y - PANE_PADDING).max(0.0);
+                let col = (rel_x / cw) as usize;
+                let row = (rel_y / ch) as usize;
+                return Some((*id, col, row));
+            }
+        }
+        None
+    }
+
+    /// Extract selected text from the terminal grid (screen-coord selection).
+    fn extract_selection_text(&self, sel: &SelectionState) -> String {
+        let tab = match self.tabs.get(self.active_tab) {
+            Some(t) => t,
+            None => return String::new(),
+        };
+        let term_arc = match tab.panes.get(&sel.pane_id) {
+            Some(t) => &t.term,
+            None => return String::new(),
+        };
+        let (c1, r1, c2, r2) = sel.normalized();
+        let t = term_arc.lock();
+        let grid = t.grid();
+        let cols = grid.columns();
+        let display_offset = grid.display_offset() as i32;
+        let mut text = String::new();
+        for row in r1..=r2 {
+            let line = Line(row as i32 - display_offset);
+            let sc1 = if row == r1 { c1 } else { 0 };
+            let sc2 = if row == r2 { c2 } else { cols.saturating_sub(1) };
+            let mut line_text = String::new();
+            for col in sc1..=sc2.min(cols.saturating_sub(1)) {
+                let cell = &grid[Point::new(line, Column(col))];
+                line_text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+            let trimmed = line_text.trim_end_matches(' ');
+            text.push_str(trimmed);
+            if row < r2 {
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    fn copy_selection(&mut self) {
+        let text = match &self.selection {
+            Some(sel) => self.extract_selection_text(sel),
+            None => return,
+        };
+        if text.is_empty() { return; }
+        if let Some(cb) = self.clipboard.as_mut() {
+            cb.set_text(text).ok();
+        }
+    }
+
     fn try_shortcut(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) -> bool {
         let mods = self.modifiers;
+
+        // Copy / Paste:
+        //   macOS  → Cmd+C (copy selection), Cmd+V (paste)
+        //   Linux  → Ctrl+Shift+C / Ctrl+Shift+V
+        #[cfg(target_os = "macos")]
+        if mods.super_key() && !mods.control_key() && !mods.alt_key() && event.state == ElementState::Pressed {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyV) => { self.paste_from_clipboard(); return true; }
+                PhysicalKey::Code(KeyCode::KeyC) => { self.copy_selection(); return true; }
+                _ => {}
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        if mods.control_key() && mods.shift_key() && !mods.alt_key() && event.state == ElementState::Pressed {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyV) => { self.paste_from_clipboard(); return true; }
+                PhysicalKey::Code(KeyCode::KeyC) => { self.copy_selection(); return true; }
+                _ => {}
+            }
+        }
 
         // Shift+PageUp/PageDown → scrollback navigation.
         if mods.shift_key() && !mods.control_key() && !mods.alt_key() {
@@ -581,13 +711,55 @@ impl App {
             }
         }
 
-        // Pane management (splits, focus, close, quit) stays on Ctrl+Alt.
+        // Pane management (splits, focus, close, quit) — Ctrl+Alt on all
+        // platforms. On macOS, Option+letter produces special characters via
+        // dead-key composition (e.g. Option+H → ˇ), so we match the physical
+        // key code there. On Linux/Windows the logical key works correctly.
         if !(mods.control_key() && mods.alt_key()) {
             return false;
         }
         if event.state != ElementState::Pressed {
             return true;
         }
+        #[cfg(target_os = "macos")]
+        {
+            match event.physical_key {
+                PhysicalKey::Code(KeyCode::KeyH) => {
+                    self.split_focused(Split::Horizontal);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::KeyV) => {
+                    self.split_focused(Split::Vertical);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::KeyW) => {
+                    self.close_focused(event_loop);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::KeyQ) => {
+                    event_loop.exit();
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                    self.focus_dir(Direction::Left);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::ArrowRight) => {
+                    self.focus_dir(Direction::Right);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::ArrowUp) => {
+                    self.focus_dir(Direction::Up);
+                    return true;
+                }
+                PhysicalKey::Code(KeyCode::ArrowDown) => {
+                    self.focus_dir(Direction::Down);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         match &event.logical_key {
             Key::Character(s) => {
                 let lower = s.as_str().to_ascii_lowercase();
@@ -754,16 +926,56 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
+                if self.is_selecting {
+                    if let Some((_pid, col, row)) = self.pixel_to_cell(position) {
+                        if let Some(sel) = self.selection.as_mut() {
+                            sel.cur_col = col;
+                            sel.cur_row = row;
+                            self.request_redraw();
+                        }
+                    }
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed
-                    && button == MouseButton::Left
-                    && self.tabs.len() > 1
-                    && self.cursor.y < TAB_BAR_HEIGHT as f64
-                {
-                    let idx = (self.cursor.x / TAB_WIDTH as f64) as usize;
-                    if idx < self.tabs.len() {
-                        self.switch_tab(idx);
+                if button == MouseButton::Left {
+                    match state {
+                        ElementState::Pressed => {
+                            // Tab bar click.
+                            if self.tabs.len() > 1 && self.cursor.y < TAB_BAR_HEIGHT as f64 {
+                                let idx = (self.cursor.x / TAB_WIDTH as f64) as usize;
+                                if idx < self.tabs.len() {
+                                    self.switch_tab(idx);
+                                }
+                                return;
+                            }
+                            // Start selection.
+                            self.selection = None;
+                            if let Some((pane_id, col, row)) = self.pixel_to_cell(self.cursor) {
+                                self.selection = Some(SelectionState {
+                                    pane_id,
+                                    anchor_col: col,
+                                    anchor_row: row,
+                                    cur_col: col,
+                                    cur_row: row,
+                                });
+                                self.is_selecting = true;
+                                // Focus the pane the user clicked.
+                                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                                    tab.layout.set_focused(pane_id);
+                                }
+                            }
+                        }
+                        ElementState::Released => {
+                            self.is_selecting = false;
+                            // Clear single-cell (zero-area) selections.
+                            if let Some(sel) = &self.selection {
+                                let (c1, r1, c2, r2) = sel.normalized();
+                                if c1 == c2 && r1 == r2 {
+                                    self.selection = None;
+                                }
+                            }
+                            self.request_redraw();
+                        }
                     }
                 }
             }
@@ -779,6 +991,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if let Some(bytes) = encode_key(&event, self.modifiers) {
+                    self.selection = None; // typing clears selection
                     if let Some(tab) = self.tabs.get(self.active_tab) {
                         if let Some(term) = tab.panes.get(&tab.layout.focused()) {
                             term.send_bytes(bytes);
@@ -820,11 +1033,17 @@ impl ApplicationHandler<UserEvent> for App {
                 let views: Vec<PaneView<'_>> = rects
                     .iter()
                     .filter_map(|(id, rect)| {
-                        tab.panes.get(id).map(|term| PaneView {
-                            id: *id,
-                            term: &term.term,
-                            rect: *rect,
-                            focused: *id == focused,
+                        tab.panes.get(id).map(|term| {
+                            let selection = self.selection.as_ref()
+                                .filter(|s| s.pane_id == *id)
+                                .map(|s| s.normalized());
+                            PaneView {
+                                id: *id,
+                                term: &term.term,
+                                rect: *rect,
+                                focused: *id == focused,
+                                selection,
+                            }
                         })
                     })
                     .collect();

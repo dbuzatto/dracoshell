@@ -17,7 +17,7 @@ use crate::terminal::EventProxy;
 use crate::text::{CellMetrics, TextRenderer};
 
 const FONT_SIZE: f32 = 14.0;
-const PANE_PADDING: f32 = 10.0;
+pub const PANE_PADDING: f32 = 10.0;
 const BORDER_WIDTH: f32 = 1.5;
 
 /// Bundled font so the binary works regardless of the host's font config.
@@ -35,6 +35,8 @@ pub struct PaneView<'a> {
     pub term: &'a Arc<FairMutex<Term<EventProxy>>>,
     pub rect: Rect,
     pub focused: bool,
+    /// Selected cell range in screen coordinates: (col1, row1, col2, row2) already normalized.
+    pub selection: Option<(usize, usize, usize, usize)>,
 }
 
 /// Top-bar describing the open tabs. `None` is passed when there's only one
@@ -46,6 +48,7 @@ pub struct TabBarInfo {
     pub width: f32,
 }
 
+const SELECTION_RGBA: [f32; 4] = [1.0, 1.0, 1.0, 0.25];
 const TAB_BG_INACTIVE: [f32; 4] = [0.13, 0.14, 0.16, 1.0];
 const TAB_BG_ACTIVE: [f32; 4] = [1.0, 0.16, 0.16, 1.0];
 const TAB_BAR_BG: [f32; 4] = [0.08, 0.08, 0.10, 1.0];
@@ -81,7 +84,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, _app_config: &Config) -> Result<Self> {
+    pub async fn new(window: Arc<Window>, app_config: &Config) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -132,7 +135,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let text = TextRenderer::new(&device, &queue, format, FONT_BYTES, FONT_SIZE)?;
+        let text = TextRenderer::new(&device, &queue, format, FONT_BYTES, app_config.font.size)?;
         let bg_quads = QuadRenderer::new(&device, format);
         let fg_quads = QuadRenderer::new(&device, format);
         let metrics = text.metrics();
@@ -386,10 +389,27 @@ impl Renderer {
             }
         }
 
-        // Overlay quads (cursor + focus borders + scrollbar).
+        // Overlay quads (selection + cursor + focus borders + scrollbar).
         let many = panes.len() > 1;
         self.fg_quads.begin();
         for (pane, snap) in panes.iter().zip(snaps.iter()) {
+            // Selection highlight.
+            if let Some((c1, r1, c2, r2)) = pane.selection {
+                let origin = [
+                    (pane.rect.x + PANE_PADDING).round(),
+                    (pane.rect.y + PANE_PADDING).round(),
+                ];
+                let cols = snap.rows.first().map(|r| r.len()).unwrap_or(0);
+                for row in r1..=r2 {
+                    let sel_c1 = if row == r1 { c1 } else { 0 };
+                    let sel_c2 = if row == r2 { c2 } else { cols.saturating_sub(1) };
+                    if sel_c1 > sel_c2 { continue; }
+                    let x = origin[0] + sel_c1 as f32 * self.metrics.cell_w;
+                    let y = origin[1] + row as f32 * self.metrics.cell_h;
+                    let w = (sel_c2 - sel_c1 + 1) as f32 * self.metrics.cell_w;
+                    self.fg_quads.quad(x, y, w, self.metrics.cell_h, SELECTION_RGBA);
+                }
+            }
             if pane.focused {
                 // Cursor is hidden while scrolled into history — that's how
                 // other terminals behave (the cursor really is off-screen).
