@@ -112,20 +112,14 @@ fn run_themes() -> Result<()> {
 fn run_onboard() -> Result<()> {
     println!("{}", SETUP_BANNER);
     println!("  Welcome to dracoshell. Quick first-run setup:");
+    println!("  (Backspace to edit · Enter to confirm · Ctrl-C to quit)");
     println!();
 
-    let font_size = prompt_with_default("  Font size", "14.0")?
-        .parse::<f32>()
-        .unwrap_or(14.0);
-    let accent = {
-        let raw = prompt_with_default("  Accent color (hex)", "#FF2A2A")?;
-        let v = raw.trim();
-        if v.is_empty() {
-            "#FF2A2A".to_string()
-        } else {
-            v.to_string()
-        }
-    };
+    crossterm::terminal::enable_raw_mode().context("enable raw mode")?;
+    let res = onboard_prompts();
+    crossterm::terminal::disable_raw_mode().ok();
+
+    let (font_size, accent) = res?;
 
     let path = config::write_custom(font_size, &accent)?;
     println!();
@@ -137,6 +131,113 @@ fn run_onboard() -> Result<()> {
     let err = std::process::Command::new(&shell).exec();
     eprintln!("failed to exec {shell}: {err}");
     std::process::exit(1);
+}
+
+fn onboard_prompts() -> Result<(f32, String)> {
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyModifiers},
+        execute,
+        style::{Color as XtColor, Print, ResetColor, SetBackgroundColor},
+        terminal::{self, ClearType},
+    };
+
+    let mut out = io::stdout();
+
+    // ── Font size (arrow key navigation) ─────────────────────────────────
+    const SIZE_MIN: f32 = 6.0;
+    const SIZE_MAX: f32 = 48.0;
+    const SIZE_DEFAULT: f32 = 14.0;
+    let mut font_size = SIZE_DEFAULT;
+
+    loop {
+        execute!(out, cursor::MoveToColumn(0), terminal::Clear(ClearType::CurrentLine))?;
+        let n = ((font_size - SIZE_MIN) / (SIZE_MAX - SIZE_MIN) * 22.0).round() as usize + 1;
+        let bar: String = "█".repeat(n.min(22));
+        execute!(
+            out,
+            Print(format!(
+                "  Font size: {:.0}  {}  ↑↓ to change · Enter to confirm",
+                font_size, bar
+            )),
+        )?;
+        io::stdout().flush().ok();
+
+        if let Event::Key(k) = event::read()? {
+            match k.code {
+                KeyCode::Enter => {
+                    execute!(out, Print("\r\n"))?;
+                    break;
+                }
+                KeyCode::Up => font_size = (font_size + 1.0).min(SIZE_MAX),
+                KeyCode::Down => font_size = (font_size - 1.0).max(SIZE_MIN),
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crossterm::terminal::disable_raw_mode().ok();
+                    std::process::exit(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    execute!(out, Print("\r\n"))?;
+
+    // ── Accent color ──────────────────────────────────────────────────────
+    const DEFAULT_ACCENT: &str = "#FF2A2A";
+    let mut cbuf = String::new();
+
+    loop {
+        execute!(out, cursor::MoveToColumn(0), terminal::Clear(ClearType::CurrentLine))?;
+        let raw = if cbuf.is_empty() { DEFAULT_ACCENT } else { &cbuf };
+        let hex = raw.trim_start_matches('#');
+
+        execute!(out, Print(format!("  Accent color [{}]: {}", DEFAULT_ACCENT, cbuf)))?;
+
+        if hex.len() == 6 {
+            match (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                (Ok(r), Ok(g), Ok(b)) => execute!(
+                    out,
+                    Print("  "),
+                    SetBackgroundColor(XtColor::Rgb { r, g, b }),
+                    Print("      "),
+                    ResetColor,
+                )?,
+                _ => execute!(out, Print("  ✗ invalid"))?,
+            }
+        } else if !hex.is_empty() {
+            execute!(out, Print("  …"))?;
+        }
+
+        io::stdout().flush().ok();
+
+        if let Event::Key(k) = event::read()? {
+            match k.code {
+                KeyCode::Enter => {
+                    execute!(out, Print("\r\n"))?;
+                    break;
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    crossterm::terminal::disable_raw_mode().ok();
+                    std::process::exit(0);
+                }
+                KeyCode::Backspace => { cbuf.pop(); }
+                KeyCode::Char(c) if c.is_ascii_hexdigit() || c == '#' => { cbuf.push(c); }
+                _ => {}
+            }
+        }
+    }
+
+    let accent = if cbuf.is_empty() {
+        DEFAULT_ACCENT.to_string()
+    } else {
+        format!("#{}", cbuf.trim_start_matches('#').to_uppercase())
+    };
+
+    Ok((font_size, accent))
 }
 
 fn prompt_with_default(label: &str, default: &str) -> Result<String> {

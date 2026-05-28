@@ -103,7 +103,7 @@ impl Renderer {
                 &wgpu::DeviceDescriptor {
                     label: Some("dracoshell device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: wgpu::Limits::default(),
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -119,11 +119,12 @@ impl Renderer {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
+        let max_dim = device.limits().max_texture_dimension_2d;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: size.width.clamp(1, max_dim),
+            height: size.height.clamp(1, max_dim),
             present_mode: caps.present_modes[0],
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -168,13 +169,145 @@ impl Renderer {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        self.config.width = size.width;
-        self.config.height = size.height;
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        self.config.width = size.width.min(max_dim);
+        self.config.height = size.height.min(max_dim);
         self.surface.configure(&self.device, &self.config);
     }
 
     pub fn forget_pane(&mut self, _id: PaneId) {
         // No per-pane state held in this renderer anymore.
+    }
+
+    /// Rebuild the glyph atlas at a new font size. Called by the onboard
+    /// wizard when the user presses ↑/↓ to preview sizes in real time.
+    pub fn set_font_size(&mut self, size: f32) -> Result<()> {
+        self.text = TextRenderer::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            FONT_BYTES,
+            size.clamp(6.0, 48.0),
+        )?;
+        self.metrics = self.text.metrics();
+        Ok(())
+    }
+
+    /// Render the first-run setup wizard directly — no PTY/terminal grid.
+    /// The entire window (banner + prompts) is rendered at the current font
+    /// size so pressing ↑/↓ makes everything visually scale in real time.
+    pub fn render_onboard(
+        &mut self,
+        font_size: f32,
+        accent_buf: &str,
+        accent_rgb: Option<(u8, u8, u8)>,
+        on_accent_step: bool,
+    ) -> Result<()> {
+        const BANNER: &[&str] = &[
+            "       __                          __         ____",
+            "  ____/ /________ _________  _____/ /_  ___  / / /",
+            " / __  / ___/ __ `/ ___/ __ \\/ ___/ __ \\/ _ \\/ / /",
+            "/ /_/ / /  / /_/ / /__/ /_/ (__  ) / / /  __/ / /",
+            "\\__,_/_/   \\__,_/\\___/\\____/____/_/ /_/\\___/_/_/",
+            "",
+            "       tiling terminal for Unix · v0.1.0",
+        ];
+
+        let w = self.config.width as f32;
+        let m = self.metrics;
+        let ox = m.cell_w;       // left margin: 1 cell
+        let oy = m.cell_h * 2.0; // top margin: 2 cells
+
+        let red   = colors::Color::rgb(0xff, 0x2a, 0x2a);
+        let white = colors::Color::rgb(0xdc, 0xdf, 0xe4);
+        let dim   = colors::Color::rgb(0x61, 0x67, 0x74);
+
+        self.text.begin();
+        self.bg_quads.begin();
+        self.fg_quads.begin();
+
+        // ── Banner ────────────────────────────────────────────────────────
+        for (row, line) in BANNER.iter().enumerate() {
+            let color = if row < 5 { red } else { dim };
+            for (col, c) in line.chars().enumerate() {
+                self.text.push_cell(&self.queue, c, col as u32, row as u32, [ox, oy], color);
+            }
+        }
+
+        let after_banner = BANNER.len() as u32 + 1;
+
+        // ── Subtitle + hint ───────────────────────────────────────────────
+        let subtitle = "  Welcome to dracoshell. Quick first-run setup:";
+        let hint     = "  (Enter to confirm  \u{b7}  Ctrl-C to quit)";
+        for (col, c) in subtitle.chars().enumerate() {
+            self.text.push_cell(&self.queue, c, col as u32, after_banner, [ox, oy], white);
+        }
+        for (col, c) in hint.chars().enumerate() {
+            self.text.push_cell(&self.queue, c, col as u32, after_banner + 1, [ox, oy], dim);
+        }
+
+        let prompt_base = after_banner + 3;
+
+        // ── Font size ─────────────────────────────────────────────────────
+        let size_line = format!("  Font size: {:.0}   \u{2191}\u{2193} to adjust", font_size);
+        let fg_size = if !on_accent_step { white } else { dim };
+        for (col, c) in size_line.chars().enumerate() {
+            self.text.push_cell(&self.queue, c, col as u32, prompt_base, [ox, oy], fg_size);
+        }
+
+        // ── Accent color ──────────────────────────────────────────────────
+        let accent_show  = if accent_buf.is_empty() { "#FF2A2A" } else { accent_buf };
+        let color_line   = format!("  Accent color: {}   ", accent_show);
+        let col_count    = color_line.chars().count() as u32;
+        let fg_color     = if on_accent_step { white } else { dim };
+        for (col, c) in color_line.chars().enumerate() {
+            self.text.push_cell(&self.queue, c, col as u32, prompt_base + 2, [ox, oy], fg_color);
+        }
+
+        // Color swatch next to label
+        let (sr, sg, sb) = accent_rgb.unwrap_or((0xff, 0x2a, 0x2a));
+        let swatch_x = ox + col_count as f32 * m.cell_w;
+        let swatch_y = oy + (prompt_base + 2) as f32 * m.cell_h + m.cell_h * 0.1;
+        self.bg_quads.quad(
+            swatch_x, swatch_y,
+            m.cell_w * 6.0, m.cell_h * 0.8,
+            [sr as f32 / 255.0, sg as f32 / 255.0, sb as f32 / 255.0, 1.0],
+        );
+
+        // Active-row underline
+        let active_row = if on_accent_step { prompt_base + 2 } else { prompt_base };
+        let ul_y = oy + active_row as f32 * m.cell_h + m.cell_h - 2.0;
+        self.fg_quads.quad(ox, ul_y, w - ox * 2.0, 2.0, DRACO_RED);
+
+        // ── Submit frame ──────────────────────────────────────────────────
+        let frame = self.surface.get_current_texture()?;
+        let view  = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("dracoshell onboard encoder"),
+        });
+        let resolution = [w, self.config.height as f32];
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("dracoshell onboard pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear_color()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.bg_quads.flush(&self.device, &self.queue, resolution, &mut pass);
+            self.text.flush(&self.device, &self.queue, resolution, &mut pass);
+            self.fg_quads.flush(&self.device, &self.queue, resolution, &mut pass);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
     }
 
     pub fn render(

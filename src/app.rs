@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
 use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::tty::Shell;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::dpi::PhysicalPosition;
@@ -26,7 +25,125 @@ const APP_ID: &str = "dracoshell";
 /// Height of the tab bar in pixels. Bar is hidden when there's only one tab.
 pub const TAB_BAR_HEIGHT: f32 = 28.0;
 
+// ── First-run onboard wizard ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OnboardStep { FontSize, AccentColor }
+
+struct OnboardState {
+    step:       OnboardStep,
+    font_size:  f32,
+    accent_buf: String,
+    accent_rgb: Option<(u8, u8, u8)>,
+}
+
+impl OnboardState {
+    fn new() -> Self {
+        Self {
+            step:       OnboardStep::FontSize,
+            font_size:  14.0,
+            accent_buf: String::new(),
+            accent_rgb: Some((0xff, 0x2a, 0x2a)), // default red swatch
+        }
+    }
+
+    fn parse_rgb(buf: &str) -> Option<(u8, u8, u8)> {
+        let hex = buf.trim_start_matches('#');
+        if hex.len() != 6 { return None; }
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some((r, g, b))
+    }
+
+    fn effective_accent(&self) -> String {
+        if self.accent_buf.is_empty() {
+            "#FF2A2A".to_string()
+        } else {
+            format!("#{}", self.accent_buf.trim_start_matches('#').to_uppercase())
+        }
+    }
+}
+
 const ICON_BYTES: &[u8] = include_bytes!("../assets/dracoshell.png");
+
+/// On macOS, winit's window icon does not appear in the Dock. The Dock icon
+/// requires an explicit NSApplication.setApplicationIconImage: call.
+/// We also apply a rounded-corner (squircle) mask so the icon matches the
+/// macOS icon shape used by all native apps.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc::runtime::{Class, Object};
+    use objc::{msg_send, sel, sel_impl};
+
+    let png = rounded_icon_png().unwrap_or_else(|| ICON_BYTES.to_vec());
+
+    unsafe {
+        let data_cls = match Class::get("NSData") {
+            Some(c) => c,
+            None => return,
+        };
+        let data: *mut Object =
+            msg_send![data_cls, dataWithBytes:png.as_ptr() length:png.len()];
+
+        let img_cls = match Class::get("NSImage") {
+            Some(c) => c,
+            None => return,
+        };
+        let img: *mut Object = msg_send![img_cls, alloc];
+        let img: *mut Object = msg_send![img, initWithData: data];
+        if img.is_null() {
+            log::warn!("could not create NSImage for Dock icon");
+            return;
+        }
+
+        let app_cls = match Class::get("NSApplication") {
+            Some(c) => c,
+            None => return,
+        };
+        let app: *mut Object = msg_send![app_cls, sharedApplication];
+        let _: () = msg_send![app, setApplicationIconImage: img];
+    }
+}
+
+/// Load the bundled PNG and apply a rounded-corner mask that approximates
+/// the macOS squircle shape (corner radius ≈ 22.5 % of the smaller dimension).
+/// Pixels outside the shape get alpha = 0; edge pixels are anti-aliased over
+/// a 2-pixel band to avoid jaggies.
+#[cfg(target_os = "macos")]
+fn rounded_icon_png() -> Option<Vec<u8>> {
+    let img = image::load_from_memory(ICON_BYTES).ok()?;
+    let mut rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as i32, rgba.height() as i32);
+    let r = (w.min(h) as f32 * 0.2247) as i32;
+
+    for y in 0..h {
+        for x in 0..w {
+            // Only the four corner regions need masking.
+            if !(x < r || x >= w - r) || !(y < r || y >= h - r) {
+                continue;
+            }
+            let cx = if x < r { r } else { w - r - 1 };
+            let cy = if y < r { r } else { h - r - 1 };
+            let dist = (((x - cx) * (x - cx) + (y - cy) * (y - cy)) as f32).sqrt();
+            let rf = r as f32;
+            if dist >= rf + 1.0 {
+                rgba.get_pixel_mut(x as u32, y as u32).0[3] = 0;
+            } else if dist > rf - 1.0 {
+                // 2-pixel anti-aliased edge
+                let a = ((rf + 1.0 - dist) * 0.5 * 255.0) as u8;
+                let current = rgba.get_pixel(x as u32, y as u32).0[3];
+                rgba.get_pixel_mut(x as u32, y as u32).0[3] = a.min(current);
+            }
+        }
+    }
+
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut cursor, image::ImageFormat::Png)
+        .ok()?;
+    Some(cursor.into_inner())
+}
 
 fn load_icon() -> Option<winit::window::Icon> {
     let img = match image::load_from_memory(ICON_BYTES) {
@@ -74,6 +191,7 @@ pub struct App {
     next_pane_id: PaneId,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
+    onboard: Option<OnboardState>,
 }
 
 impl App {
@@ -88,6 +206,93 @@ impl App {
             next_pane_id: 1,
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(0.0, 0.0),
+            onboard: None,
+        }
+    }
+
+    // ── Onboard wizard ────────────────────────────────────────────────────
+
+    fn handle_onboard_key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
+        // Copy step so we can release the immutable borrow before taking &mut.
+        let step = match self.onboard.as_ref() {
+            Some(o) => o.step,
+            None    => return,
+        };
+
+        match step {
+            OnboardStep::FontSize => match &event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    let new_size = { let o = self.onboard.as_mut().unwrap(); o.font_size = (o.font_size + 1.0).min(48.0); o.font_size };
+                    if let Some(r) = self.renderer.as_mut() { r.set_font_size(new_size).ok(); }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    let new_size = { let o = self.onboard.as_mut().unwrap(); o.font_size = (o.font_size - 1.0).max(6.0); o.font_size };
+                    if let Some(r) = self.renderer.as_mut() { r.set_font_size(new_size).ok(); }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.onboard.as_mut().unwrap().step = OnboardStep::AccentColor;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Escape) => event_loop.exit(),
+                Key::Character(s) if s.as_str() == "c" && self.modifiers.control_key() => event_loop.exit(),
+                _ => {}
+            },
+
+            OnboardStep::AccentColor => match &event.logical_key {
+                Key::Named(NamedKey::Enter) => self.finish_onboard(event_loop),
+                Key::Named(NamedKey::Backspace) => {
+                    let o = self.onboard.as_mut().unwrap();
+                    o.accent_buf.pop();
+                    o.accent_rgb = if o.accent_buf.is_empty() {
+                        Some((0xff, 0x2a, 0x2a))
+                    } else {
+                        OnboardState::parse_rgb(&o.accent_buf)
+                    };
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Escape) => event_loop.exit(),
+                Key::Character(s) if s.as_str() == "c" && self.modifiers.control_key() => event_loop.exit(),
+                Key::Character(s) => {
+                    if let Some(c) = s.chars().next() {
+                        if c.is_ascii_hexdigit() || c == '#' {
+                            let o = self.onboard.as_mut().unwrap();
+                            o.accent_buf.push(c);
+                            o.accent_rgb = OnboardState::parse_rgb(&o.accent_buf);
+                            self.request_redraw();
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn finish_onboard(&mut self, event_loop: &ActiveEventLoop) {
+        let ob = match self.onboard.take() {
+            Some(o) => o,
+            None    => return,
+        };
+        let accent = ob.effective_accent();
+        if let Err(e) = crate::config::write_custom(ob.font_size, &accent) {
+            log::error!("write config: {e}");
+        }
+        // Spawn the real shell now that config is saved
+        let pane_id = self.alloc_pane_id();
+        let viewport = self.pane_viewport();
+        let size = match self.renderer.as_ref() {
+            Some(r) => Self::rect_to_term_size(r, viewport),
+            None    => { event_loop.exit(); return; }
+        };
+        match Terminal::new(self.proxy.clone(), pane_id, size, None) {
+            Ok(term) => {
+                self.tabs.push(Tab::new(pane_id, term));
+                self.active_tab = 0;
+                self.reflow();
+                self.request_redraw();
+            }
+            Err(e) => { log::error!("spawn terminal: {e}"); event_loop.exit(); }
         }
     }
 
@@ -449,33 +654,30 @@ impl ApplicationHandler<UserEvent> for App {
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
+
+        #[cfg(target_os = "macos")]
+        set_dock_icon();
+
         let renderer = pollster::block_on(Renderer::new(window.clone(), &self.config))
             .expect("failed to initialize renderer");
 
-        let phys = window.inner_size();
-        let initial_rect = Rect {
-            x: 0.0,
-            y: 0.0,
-            w: phys.width as f32,
-            h: phys.height as f32,
-        };
-        let term_size = Self::rect_to_term_size(&renderer, initial_rect);
-
-        let pane_id = self.alloc_pane_id();
-        let shell = if !crate::config::exists() {
-            std::env::current_exe()
-                .ok()
-                .map(|p| Shell::new(p.to_string_lossy().into_owned(), vec!["--onboard".into()]))
-        } else {
-            None
-        };
-        let terminal = Terminal::new(self.proxy.clone(), pane_id, term_size, shell)
-            .expect("failed to spawn terminal");
-
-        self.window = Some(window);
+        self.window   = Some(window);
         self.renderer = Some(renderer);
-        self.tabs.push(Tab::new(pane_id, terminal));
-        self.active_tab = 0;
+
+        if !crate::config::exists() {
+            // Enter first-run wizard — render directly, no PTY yet.
+            self.onboard = Some(OnboardState::new());
+            self.request_redraw();
+        } else {
+            let phys = self.window.as_ref().unwrap().inner_size();
+            let initial_rect = Rect { x: 0.0, y: 0.0, w: phys.width as f32, h: phys.height as f32 };
+            let term_size = Self::rect_to_term_size(self.renderer.as_ref().unwrap(), initial_rect);
+            let pane_id  = self.alloc_pane_id();
+            let terminal = Terminal::new(self.proxy.clone(), pane_id, term_size, None)
+                .expect("failed to spawn terminal");
+            self.tabs.push(Tab::new(pane_id, terminal));
+            self.active_tab = 0;
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -566,6 +768,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // In onboard mode all keys are consumed by the wizard.
+                if self.onboard.is_some() {
+                    if event.state == ElementState::Pressed {
+                        self.handle_onboard_key(&event, event_loop);
+                    }
+                    return;
+                }
                 if self.try_shortcut(&event, event_loop) {
                     return;
                 }
@@ -578,6 +787,21 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // Onboard wizard renders the full window itself.
+                if let Some(ob) = &self.onboard {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        if let Err(e) = renderer.render_onboard(
+                            ob.font_size,
+                            &ob.accent_buf,
+                            ob.accent_rgb,
+                            ob.step == OnboardStep::AccentColor,
+                        ) {
+                            log::error!("onboard render: {e}");
+                        }
+                    }
+                    return;
+                }
+
                 let (Some(renderer), Some(tab)) =
                     (self.renderer.as_mut(), self.tabs.get(self.active_tab))
                 else {

@@ -26,6 +26,15 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "5"
 fontdue = "0.9"
+crossterm = "0.28"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+# Force rustix 0.38 to compile with the `std` feature so its OwnedFd is
+# a re-export of std::os::fd::OwnedFd, eliminating the type conflict with
+# rustix-openpty on Rust 1.63+.
+rustix = { version = "0.38", features = ["std"] }
 
 [profile.release]
 opt-level = 3
