@@ -19,3 +19,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+----------------------------------------------------------------------
+
+LOGO / MASCOT EXCEPTION
+
+The "Draco" mascot and logo file (`assets/dracoshell.png`) are NOT covered
+by the MIT license above. They are Copyright (c) 2026 Diogo Buzatto, all
+rights reserved.
+
+You MAY:
+  - reference the logo when referring to this project (blog posts, articles,
+    links back to the repository).
+
+You MAY NOT:
+  - redistribute the logo as part of a fork published under a different
+    name;
+  - use the logo to identify or promote a derivative work as if it were
+    this project;
+  - alter the logo to create a substantially similar mark for another
+    product.
+
+Forks that wish to redistribute must replace `assets/dracoshell.png` with
+their own artwork.
+

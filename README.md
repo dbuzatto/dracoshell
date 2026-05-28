@@ -131,8 +131,12 @@ dracoshell --version   Show version
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+Source code is **MIT** — see [`LICENSE`](LICENSE).
 
-Bundled assets:
-- `assets/Hack-Regular.ttf` — Hack font, MIT licensed.
-- `assets/dracoshell.png` — Draco logo, this project.
+> **Logo notice:** The Draco mascot (`assets/dracoshell.png`) is **not**
+> covered by the MIT license. It is © 2026 Diogo Buzatto, all rights
+> reserved. You may reference it when linking back to this project, but
+> forks must replace it before redistributing.
+
+Bundled third-party assets:
+- `assets/Hack-Regular.ttf` — [Hack font](https://github.com/source-foundry/Hack), MIT licensed.
