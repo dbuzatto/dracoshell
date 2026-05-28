@@ -1,0 +1,34 @@
+[package]
+name = "dracoshell"
+version = "0.1.0"
+edition = "2021"
+description = "A tiling terminal emulator inspired by Hyprland"
+license = "MIT"
+repository = "https://github.com/dbuzatto/dracoshell"
+readme = "README.md"
+rust-version = "1.75"
+
+[[bin]]
+name = "dracoshell"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+wgpu = "22"
+pollster = "0.4"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+alacritty_terminal = "0.24"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+fontdue = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
